@@ -21,9 +21,18 @@ type tapInterface struct {
 // Needs TunTapOSXDriver to be installed
 func NewTAPInterface() (vnet.VirtualNetworkInterface, error) {
 	// not allow to name interface by user
-	interfaceName := fmt.Sprint(inetName, inetCount)
+	var interfaceName string
 
-	inetCount++
+	// TODO Probably there is a better solution
+	for {
+		interfaceName = fmt.Sprint(inetName, inetCount)
+		_, err := net.InterfaceByName(interfaceName)
+		if err != nil {
+			break
+		}
+
+		inetCount++
+	}
 
 	tap, err := water.New(water.Config{
 		DeviceType: water.TAP,
@@ -40,6 +49,8 @@ func NewTAPInterface() (vnet.VirtualNetworkInterface, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	inetCount++
 
 	return &tapInterface{
 		Interface: tap,

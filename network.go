@@ -2,19 +2,19 @@ package vnet
 
 import (
 	"context"
-	"github.com/gyf304/water/waterutil"
 	"log"
 
+	"github.com/gyf304/water/waterutil"
 	"github.com/libp2p/go-libp2p-core/host"
+	inet "github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
-	inet "github.com/libp2p/go-libp2p-net"
-	peerstore "github.com/libp2p/go-libp2p-peerstore"
 	"github.com/libp2p/go-libp2p-pubsub"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/songgao/packets/ethernet"
 )
 
-const Protocol = protocol.ID("tap")
+const Protocol = protocol.ID("/tap")
 
 type network struct {
 	ctx    context.Context
@@ -23,8 +23,9 @@ type network struct {
 	name string
 
 	host host.Host
-	ps   *pubsub.PubSub
-	sub  *pubsub.Subscription
+
+	ps  *pubsub.PubSub
+	sub *pubsub.Subscription
 
 	inet VirtualNetworkInterface
 
@@ -53,7 +54,7 @@ func NewVirtualNetwork(ctx context.Context, name string, host host.Host, ps *pub
 		inet:   inet,
 		self: PeerInfo{
 			mac:  inet.MAC(),
-			addr: host.Peerstore().Addrs(host.ID())[0],
+			addr: host.Addrs()[0],
 		},
 		members: make(map[string]*networkMember),
 		ingoing: make(chan ethernet.Frame, 32),
@@ -124,20 +125,24 @@ func (net *network) listen() {
 		case frame := <-frames:
 			dest := frame.Destination()
 			if waterutil.IsBroadcast(dest) {
+				log.Printf("Broadcasting frame...")
 				for _, m := range net.members {
 					m.outgoing <- frame
 				}
 			} else {
 				m, ok := net.members[dest.String()]
 				if !ok {
+					log.Println("Unknown destination frame")
 					continue
 				}
+
+				log.Printf("Sending frame to %s", m.info.mac)
 
 				// TODO Better connection strategy
 				if m.stream == nil {
 					m.stream, err = net.host.NewStream(net.ctx, m.id, Protocol)
 					if err != nil {
-						err = net.host.Connect(net.ctx, peerstore.PeerInfo{
+						err = net.host.Connect(net.ctx, peer.AddrInfo{
 							ID: m.id,
 							Addrs: []multiaddr.Multiaddr{
 								m.info.addr,
@@ -164,6 +169,7 @@ func (net *network) listen() {
 
 			mac := info.mac.String()
 			if _, ok := net.members[mac]; !ok {
+				log.Printf("New member %s", mac)
 				net.members[mac] = &networkMember{
 					id:       msg.GetFrom(),
 					info:     info,
@@ -201,27 +207,25 @@ func (net *network) announceSelf() error {
 }
 
 func (net *network) handle(s inet.Stream) {
-	for {
-		go func() {
-			var frame ethernet.Frame
-			for {
-				select {
-				case <-net.ctx.Done():
-					return
-				default:
-				}
-
-				frame.Resize(1500)
-				n, err := s.Read([]byte(frame))
-				if err != nil {
-					log.Println(err)
-					return
-				}
-
-				net.ingoing <- frame[:n]
+	go func() {
+		var frame ethernet.Frame
+		for {
+			select {
+			case <-net.ctx.Done():
+				return
+			default:
 			}
-		}()
-	}
+
+			frame.Resize(1500)
+			n, err := s.Read([]byte(frame))
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+			net.ingoing <- frame[:n]
+		}
+	}()
 }
 
 func (net *network) Close() error {

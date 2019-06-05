@@ -4,6 +4,7 @@ import (
 	inet "github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/songgao/packets/ethernet"
+	"log"
 )
 
 type networkMember struct {
@@ -25,6 +26,8 @@ func (m *networkMember) receive() {
 			if !ok {
 				return
 			}
+
+			log.Printf("Received frame from: %s", m.info.mac)
 
 			_, err := m.stream.Write(frame)
 			if err != nil {
