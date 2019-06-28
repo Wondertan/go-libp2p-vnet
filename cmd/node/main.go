@@ -2,87 +2,134 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
-	vnet "github.com/Wondertan/go-libp2p-vnet"
-	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p-core/host"
-	"github.com/libp2p/go-libp2p-core/peer"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/p2p/discovery"
 	"log"
 	"os"
 	"os/signal"
-	"time"
 
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/routing"
+	discovery "github.com/libp2p/go-libp2p-discovery"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	golog "github.com/whyrusleeping/go-logging"
+
+	vnet "github.com/Wondertan/go-libp2p-vnet"
 	"github.com/Wondertan/go-libp2p-vnet/tap"
 )
 
-var listen = flag.String("listen", "", "")
-var dial = flag.String("dial", "", "")
+var (
+	iAddr      = flag.String("interface", "10.0.0.10/24", "")
+	listenAddr = flag.String("listen", "", "")
+	rendezvous = flag.String("rendezvous", "vnet", "")
+	key        = flag.String("key", "", "")
+)
 
 func main() {
-	rendezvous := "test"
+	golog.SetLevel(golog.DEBUG, "vnet")
 
+	err := run(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(ctx context.Context) error {
 	flag.Parse()
 
-	ctx := context.Background()
+	var opts []libp2p.Option
+	var dhtRouter *dht.IpfsDHT
 
-	host, err := libp2p.New(ctx,
-		libp2p.ListenAddrStrings(*listen),
+	if *key == "" {
+		key, _, _ := crypto.GenerateEd25519Key(rand.Reader)
+		strKey, err := keyToString(key)
+		if err != nil {
+			return err
+		}
+
+		log.Printf("New identity generated: %s", strKey)
+		opts = append(opts, libp2p.Identity(key))
+	} else {
+		key, err := keyFromString(*key)
+		if err != nil {
+			return err
+		}
+
+		opts = append(opts, libp2p.Identity(key))
+	}
+
+	if *listenAddr != "" {
+		opts = append(opts, libp2p.ListenAddrStrings(*listenAddr))
+	}
+
+	opts = append(opts,
+		libp2p.Routing(
+			func(h host.Host) (_ routing.PeerRouting, err error) {
+				dhtRouter, err = dht.New(ctx, h)
+				return dhtRouter, err
+			},
+		),
+		libp2p.DisableRelay(),
 	)
+
+	rhost, err := libp2p.New(ctx, opts...)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	ser, err := discovery.NewMdnsService(ctx, host, 10*time.Second, rendezvous)
+	bootstrap(ctx, rhost)
+
+	err = dhtRouter.Bootstrap(ctx)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	ps, err := pubsub.NewGossipSub(ctx, host)
+	vi, err := tap.NewTAPInterface(ctx, tap.Address(*iAddr))
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	tap, err := tap.NewTAPInterface()
+	net, err := vnet.NewVirtualNetwork(ctx, *rendezvous, rhost, vi, discovery.NewRoutingDiscovery(dhtRouter))
 	if err != nil {
-		panic(err)
-	}
-
-	net, err := vnet.NewVirtualNetwork(ctx, rendezvous, host, ps, tap)
-	if err != nil {
-		panic(err)
+		return err
 	}
 
 	ch := make(chan os.Signal)
 	signal.Notify(ch, os.Interrupt)
 
 	go func() {
-		select {
-		case <-ch:
-			fmt.Println("Closing...")
-			ser.Close()
-			net.Close()
-			tap.Close()
-			os.Exit(0)
-		}
+		<-ch
+		fmt.Println("Closing...")
+
+		net.Close()
+		vi.Close()
+		dhtRouter.Close()
+		rhost.Close()
+
+		os.Exit(0)
 	}()
 
 	select {}
 }
 
-type notifee struct {
-	host.Host
+func keyToString(key crypto.PrivKey) (string, error) {
+	b, err := key.Bytes()
+	if err != nil {
+		return "", err
+	}
 
-	ctx context.Context
+	return hex.EncodeToString(b), nil
 }
 
-func (n *notifee) HandlePeerFound(p peer.AddrInfo) {
-	log.Printf("Found peer: %s", p)
-	log.Println(n.Connect(n.ctx, p))
-}
+func keyFromString(key string) (crypto.PrivKey, error) {
+	b, err := hex.DecodeString(key)
+	if err != nil {
+		return nil, err
+	}
 
-func NewNotifee(ctx context.Context, host host.Host) discovery.Notifee {
-	return &notifee{ctx: ctx, Host: host}
+	return crypto.UnmarshalPrivateKey(b)
 }

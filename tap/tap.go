@@ -1,11 +1,14 @@
 package tap
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"os/exec"
+
+	"github.com/gyf304/water"
 
 	vnet "github.com/Wondertan/go-libp2p-vnet"
-	"github.com/gyf304/water"
 )
 
 var inetName = "tap"
@@ -19,7 +22,13 @@ type tapInterface struct {
 
 // NewTAPInterface creates new TAP interface
 // Needs TunTapOSXDriver to be installed
-func NewTAPInterface() (vnet.VirtualNetworkInterface, error) {
+func NewTAPInterface(ctx context.Context, opts ...Option) (vnet.VirtualNetworkInterface, error) {
+	def := &tapCfg{}
+
+	for _, opt := range opts {
+		opt(def)
+	}
+
 	// not allow to name interface by user
 	var interfaceName string
 
@@ -52,6 +61,19 @@ func NewTAPInterface() (vnet.VirtualNetworkInterface, error) {
 
 	inetCount++
 
+	if def.Address != "" {
+		cmd := exec.Command("ifconfig", inet.Name, def.Address)
+		err = cmd.Run()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	go func() {
+		<-ctx.Done()
+		tap.Close()
+	}()
+
 	return &tapInterface{
 		Interface: tap,
 		mac:       inet.HardwareAddr,
@@ -60,4 +82,19 @@ func NewTAPInterface() (vnet.VirtualNetworkInterface, error) {
 
 func (t *tapInterface) MAC() net.HardwareAddr {
 	return t.mac
+}
+
+type tapCfg struct {
+	Address string
+}
+
+type Option func(cfg *tapCfg)
+
+// Address ties the provided address to the created tap interface
+func Address(ip string) Option {
+	return func(cfg *tapCfg) {
+		if cfg.Address == "" {
+			cfg.Address = ip
+		}
+	}
 }

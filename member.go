@@ -1,39 +1,49 @@
 package vnet
 
 import (
+	"context"
+	"net"
+
 	inet "github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/songgao/packets/ethernet"
-	"log"
 )
 
 type networkMember struct {
 	id       peer.ID
-	info     *PeerInfo
+	mac      net.HardwareAddr
 	outgoing chan ethernet.Frame
 	stream   inet.Stream
 }
 
-func (m *networkMember) Close() error {
-	close(m.outgoing)
-	return m.stream.Reset()
+func (m *networkMember) Send(frame ethernet.Frame) bool {
+	if m.stream != nil {
+		m.outgoing <- frame
+		return true
+	}
+
+	return false
 }
 
-func (m *networkMember) receive() {
+func (m *networkMember) receive(ctx context.Context) {
+	defer func() {
+		m.outgoing = nil
+		m.stream.Reset()
+	}()
+
 	for {
 		select {
-		case frame, ok := <-m.outgoing:
-			if !ok {
-				return
-			}
-
-			log.Printf("Received frame from: %s", m.info.mac)
+		case frame := <-m.outgoing:
+			log.Debugf("Sending frame to %s...", m.stream.Conn().RemotePeer())
 
 			_, err := m.stream.Write(frame)
 			if err != nil {
+				log.Errorf("error writing to %s: %s", m.stream.Conn().RemotePeer(), err)
 				m.stream.Reset()
 				return
 			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }

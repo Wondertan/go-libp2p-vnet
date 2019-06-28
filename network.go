@@ -1,234 +1,244 @@
 package vnet
 
 import (
+	"bytes"
 	"context"
-	"log"
+	"io"
+	"net"
+	"sync"
+	"time"
 
 	"github.com/gyf304/water/waterutil"
+	logging "github.com/ipfs/go-log"
+	idiscovery "github.com/libp2p/go-libp2p-core/discovery"
 	"github.com/libp2p/go-libp2p-core/host"
 	inet "github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
+	discovery "github.com/libp2p/go-libp2p-discovery"
 	"github.com/libp2p/go-libp2p-pubsub"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/songgao/packets/ethernet"
 )
 
 const Protocol = protocol.ID("/tap")
 
-type network struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+const (
+	MTU     = 1500
+	MACSize = 6
+)
 
+var log = logging.Logger("vnet")
+
+type network struct {
 	name string
 
-	host host.Host
+	host      host.Host
+	inet      VirtualNetworkInterface
+	discovery idiscovery.Discovery
 
-	ps  *pubsub.PubSub
-	sub *pubsub.Subscription
+	ingoing  chan ethernet.Frame
+	outgoing chan ethernet.Frame
+	msgs     chan *pubsub.Message
 
-	inet VirtualNetworkInterface
+	newMember chan peer.ID
+	members   map[peer.ID]*networkMember
 
-	self PeerInfo
-
-	members map[string]*networkMember
-	ingoing chan ethernet.Frame
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func NewVirtualNetwork(ctx context.Context, name string, host host.Host, ps *pubsub.PubSub, inet VirtualNetworkInterface) (*network, error) {
+func NewVirtualNetwork(ctx context.Context, name string, host host.Host, inet VirtualNetworkInterface, d idiscovery.Discovery) (*network, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
-	// TODO Add validation
-	sub, err := ps.Subscribe(name)
-	if err != nil {
-		return nil, err
-	}
-
 	n := &network{
-		ctx:    ctx,
-		cancel: cancel,
-		name:   name,
-		host:   host,
-		ps:     ps,
-		sub:    sub,
-		inet:   inet,
-		self: PeerInfo{
-			mac:  inet.MAC(),
-			addr: host.Addrs()[0],
-		},
-		members: make(map[string]*networkMember),
-		ingoing: make(chan ethernet.Frame, 32),
+		name:      name,
+		host:      host,
+		inet:      inet,
+		discovery: d,
+		ingoing:   make(chan ethernet.Frame, 32),
+		outgoing:  make(chan ethernet.Frame, 32),
+		msgs:      make(chan *pubsub.Message, 32),
+		members:   make(map[peer.ID]*networkMember),
+		newMember: make(chan peer.ID),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
-	err = n.announceSelf()
+	err := n.bootstrap()
 	if err != nil {
 		return nil, err
 	}
 
-	host.SetStreamHandler(Protocol, n.handle)
+	go n.router()
+	go n.handleOutgoing()
+	go n.handleIngoing()
+	host.SetStreamHandler(Protocol, n.handleStream)
+	host.Network().Notify((*networkNotify)(n))
 
-	go n.listen()
-
-	return n, err
-}
-
-func (net *network) listen() {
-	var err error
-	frames := make(chan ethernet.Frame)
-	msgs := make(chan *pubsub.Message)
-
-	go func() {
-		for {
-			msg, err := net.sub.Next(net.ctx)
-			if err != nil {
-				return
-			}
-
-			msgs <- msg
-		}
-	}()
-
-	go func() {
-		var frame ethernet.Frame
-		for {
-			select {
-			case <-net.ctx.Done():
-				return
-			default:
-			}
-
-			frame.Resize(1500)
-			n, err := net.inet.Read([]byte(frame))
-			if err != nil {
-				log.Println(err)
-				return
-			}
-
-			frames <- frame[:n]
-		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case frame := <-net.ingoing:
-				_, err := net.inet.Write(frame)
-				if err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	for {
-		select {
-		case frame := <-frames:
-			dest := frame.Destination()
-			if waterutil.IsBroadcast(dest) {
-				log.Printf("Broadcasting frame...")
-				for _, m := range net.members {
-					m.outgoing <- frame
-				}
-			} else {
-				m, ok := net.members[dest.String()]
-				if !ok {
-					log.Println("Unknown destination frame")
-					continue
-				}
-
-				log.Printf("Sending frame to %s", m.info.mac)
-
-				// TODO Better connection strategy
-				if m.stream == nil {
-					m.stream, err = net.host.NewStream(net.ctx, m.id, Protocol)
-					if err != nil {
-						err = net.host.Connect(net.ctx, peer.AddrInfo{
-							ID: m.id,
-							Addrs: []multiaddr.Multiaddr{
-								m.info.addr,
-							},
-						})
-						m.stream, err = net.host.NewStream(net.ctx, m.id, Protocol)
-						if err != nil {
-							continue
-						}
-					}
-
-					go m.receive()
-				}
-
-				m.outgoing <- frame
-			}
-		case msg := <-msgs:
-			info := &PeerInfo{}
-			err := info.UnmarshalBinary(msg.Data)
-			if err != nil {
-				continue
-				log.Println(err)
-			}
-
-			mac := info.mac.String()
-			if _, ok := net.members[mac]; !ok {
-				log.Printf("New member %s", mac)
-				net.members[mac] = &networkMember{
-					id:       msg.GetFrom(),
-					info:     info,
-					outgoing: make(chan ethernet.Frame, 32),
-				}
-
-				// TODO Not a best decision
-				err = net.announceSelf()
-				if err != nil {
-					log.Println(err)
-				}
-			}
-		case <-net.ctx.Done():
-			net.sub.Cancel()
-
-			for _, m := range net.members {
-				m.Close()
-			}
-		}
-	}
-}
-
-func (net *network) announceSelf() error {
-	selfB, err := net.self.MarshalBinary()
-	if err != nil {
-		return err
-	}
-
-	err = net.ps.Publish(net.name, selfB)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (net *network) handle(s inet.Stream) {
-	go func() {
-		var frame ethernet.Frame
-		for {
-			select {
-			case <-net.ctx.Done():
-				return
-			default:
-			}
-
-			frame.Resize(1500)
-			n, err := s.Read([]byte(frame))
-			if err != nil {
-				log.Println(err)
-				return
-			}
-
-			net.ingoing <- frame[:n]
-		}
-	}()
+	return n, nil
 }
 
 func (net *network) Close() error {
 	net.cancel()
 	return nil
+}
+
+func (net *network) bootstrap() error {
+	discovery.Advertise(net.ctx, net.discovery, net.name)
+
+	wg := &sync.WaitGroup{}
+
+	fctx, cancel := context.WithTimeout(net.ctx, time.Second*30)
+	defer cancel()
+
+	peers, err := net.discovery.FindPeers(fctx, net.name)
+	if err != nil {
+		return err
+	}
+
+	for info := range peers {
+		if info.ID == net.host.ID() {
+			continue
+		}
+
+		wg.Add(1)
+		go func(info peer.AddrInfo) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(net.ctx, time.Second*15)
+			defer cancel()
+
+			log.Infof("Network member %s found, connecting....", info.ID)
+			err := net.host.Connect(ctx, info)
+			if err != nil {
+				log.Debugf("error connecting to network member %s: %s", info.ID, err.Error())
+				return
+			}
+		}(info)
+	}
+
+	wg.Wait()
+
+	return nil
+}
+
+func (net *network) findReceivers(dest net.HardwareAddr) []*networkMember {
+	var receivers []*networkMember
+	isBroad := waterutil.IsBroadcast(dest)
+
+	for _, m := range net.members {
+		if isBroad || bytes.Equal(m.mac, dest) {
+			receivers = append(receivers, m)
+		}
+	}
+
+	return receivers
+}
+
+func (net *network) router() {
+	for {
+		select {
+		case frame := <-net.outgoing:
+			receivers := net.findReceivers(frame.Destination())
+			for _, r := range receivers {
+				log.Debugf("Sending from to %s", r.id)
+				if !r.Send(frame) {
+					delete(net.members, r.id)
+				}
+			}
+		case p := <-net.newMember:
+			m := &networkMember{
+				id:       p,
+				mac:      make([]byte, MACSize),
+				outgoing: make(chan ethernet.Frame, 32),
+			}
+
+			go func(m *networkMember) {
+				stream, err := net.host.NewStream(net.ctx, m.id, Protocol)
+				if err != nil {
+					log.Errorf("error establishing new stream to peer %s: %s", p, err)
+					return
+				}
+
+				_, err = stream.Read(m.mac)
+				if err != nil {
+					log.Errorf("error sending MAC to peer %s: %s", p, err)
+					return
+				}
+
+				m.stream = stream
+				go m.receive(net.ctx)
+			}(m)
+
+			net.members[p] = m
+		case <-net.ctx.Done():
+			return
+		}
+	}
+}
+
+func (net *network) handleOutgoing() {
+	var frame ethernet.Frame
+	for {
+		frame.Resize(MTU)
+		n, err := net.inet.Read([]byte(frame))
+		if err != nil {
+			log.Errorf("error reading from VN", err)
+			return
+		}
+
+		select {
+		case net.outgoing <- frame[:n]:
+		case <-net.ctx.Done():
+			return
+		}
+	}
+}
+
+func (net *network) handleIngoing() {
+	for {
+		select {
+		case frame := <-net.ingoing:
+			_, err := net.inet.Write(frame)
+			if err != nil {
+				log.Errorf("error writing to VN", err)
+				return
+			}
+		case <-net.ctx.Done():
+			return
+		}
+	}
+}
+
+func (net *network) handleStream(s inet.Stream) {
+	peer := s.Conn().RemotePeer()
+
+	_, err := s.Write(net.inet.MAC())
+	if err != nil {
+		log.Errorf("error writing mac address to %s: %s", peer, err)
+		return
+	}
+
+	var frame ethernet.Frame
+	for {
+		frame.Resize(MTU)
+		n, err := s.Read([]byte(frame))
+		if err != nil {
+			if err != io.EOF {
+				log.Errorf("error reading from %s: %s", peer, err)
+				s.Reset()
+				return
+			}
+
+			return
+		}
+
+		log.Debugf("Received frame from: %s", peer)
+
+		select {
+		case net.ingoing <- frame[:n]:
+		case <-net.ctx.Done():
+			return
+		}
+	}
 }
